@@ -34,7 +34,12 @@ không phải xác thực người dùng production.
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+
+PRINCIPALS_FILE = Path(__file__).resolve().parent.parent / "data" / "principals.json"
 
 
 @dataclass(frozen=True)
@@ -51,5 +56,55 @@ class PolicyContext:
     expires_at: str = ""
 
 
+def _load_principals() -> dict:
+    # Nguồn tin cậy mô phỏng; lỗi đọc file => fail closed (không có principal nào).
+    try:
+        return json.loads(PRINCIPALS_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def _expired(expires_at: str) -> bool | None:
+    """True nếu đã hết hạn, None nếu thiếu/không parse được (coi là deny)."""
+    if not expires_at:
+        return None
+    try:
+        parsed = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed <= datetime.now(timezone.utc)
+
+
 def check(context: PolicyContext) -> tuple[bool, str]:
-    raise NotImplementedError("BƯỚC 3b: implement policy check")
+    """Trả về (allow, reason); reason luôn non-empty."""
+    # Rule tối thiểu: dữ liệu restricted không được đi cùng egress.
+    if context.data_classification == "restricted" and context.egress_enabled is True:
+        return False, "deny: restricted data must not be combined with egress (lethal trifecta)"
+
+    principal = _load_principals().get(context.principal_id) if context.principal_id else None
+    if not principal:
+        return False, f"deny: unknown or missing principal {context.principal_id!r}"
+
+    expired = _expired(context.expires_at)
+    if expired is None:
+        return False, "deny: missing or invalid expires_at for this run"
+    if expired:
+        return False, f"deny: run expired at {context.expires_at}"
+
+    tool = context.requested_tool
+    if not tool:
+        return False, "deny: no requested_tool specified"
+    if tool not in principal.get("allowed_tools", []):
+        return False, f"deny: principal {context.principal_id} is not allowed to use {tool}"
+    if context.request_purpose not in principal.get("purposes", []):
+        return False, (f"deny: purpose {context.request_purpose!r} is not permitted "
+                       f"for principal {context.principal_id}")
+    if tool not in context.agent_scopes:
+        return False, f"deny: {tool} is outside the agent scopes"
+    if context.delegation_depth > 0 and tool not in context.parent_scopes:
+        return False, f"deny: {tool} exceeds parent_scopes of the delegating agent"
+
+    return True, (f"allow: {context.principal_id} may use {tool} for {context.request_purpose} "
+                  f"({context.data_classification}, depth={context.delegation_depth})")
