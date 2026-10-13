@@ -7,3 +7,5 @@ reports/sink.log
 reports/ledger.jsonl
 reports/attack-before.log
 reports/attack-after.log
+
+.tools/
