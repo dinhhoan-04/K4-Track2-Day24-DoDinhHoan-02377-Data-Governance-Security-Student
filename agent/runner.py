@@ -59,16 +59,134 @@ Interface bắt buộc (agent/loop.py import và gọi hàm này nếu tồn t�
 """
 from __future__ import annotations
 
+import hashlib
+import json
+import re
+import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+from agent import ledger, pii, policy, tools
 
 REPORTS_DIR = Path(__file__).resolve().parent.parent / "reports"
 DEFAULT_LEDGER_PATH = REPORTS_DIR / "ledger.jsonl"
+
+RUN_TTL = timedelta(minutes=15)
+PARENT_SCOPES = ("search_docs", "read_customer")  # quyền của orchestrator đã ủy quyền
+_TICKET_FILE_RE = re.compile(r"^ticket-(\d+)[a-z]?\.md$")
 
 
 class RunnerScaffoldPending(NotImplementedError):
     """Only the original 3c stub uses this to enable the CP1/CP2 baseline."""
 
 
+def _args_hash(args: dict) -> str:
+    return hashlib.sha256(json.dumps(args, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
+class _Gate:
+    """PEP + audit cho một run: mọi tool call đi qua `call()`."""
+
+    def __init__(self, ledger_path: Path, principal_id: str, agent_id: str, run_id: str,
+                 scopes: tuple[str, ...], depth: int, purpose: str, expires_at: str):
+        self.path, self.principal_id, self.agent_id, self.run_id = ledger_path, principal_id, agent_id, run_id
+        self.scopes, self.depth, self.purpose, self.expires_at = scopes, depth, purpose, expires_at
+
+    def decide(self, tool: str, args: dict, classification: str, egress: bool = False):
+        allow, reason = policy.check(policy.PolicyContext(
+            data_classification=classification,
+            request_purpose=self.purpose,
+            agent_owner=self.agent_id,
+            delegation_depth=self.depth,
+            egress_enabled=egress,
+            principal_id=self.principal_id,
+            requested_tool=tool,
+            agent_scopes=self.scopes,
+            parent_scopes=PARENT_SCOPES if self.depth > 0 else (),
+            expires_at=self.expires_at,
+        ))
+        self.log(tool, args, classification, "allow" if allow else "deny", reason or "no reason given")
+        return allow, reason
+
+    def log(self, tool: str, args: dict, classification: str, decision: str, reason: str, **extra) -> None:
+        entry = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "agent_id": self.agent_id,
+            "run_id": self.run_id,
+            "on_behalf_of": self.principal_id,
+            "expires_at": self.expires_at,
+            "tool": tool,
+            "args_hash": _args_hash(args),
+            "classification": classification,
+            "decision": decision,
+            "reason": reason,
+        }
+        entry.update(extra)
+        ledger.append(entry, self.path)
+
+
+def _ticket_ids(docs: list[dict]) -> list[int]:
+    """Chỉ lấy số từ TÊN FILE — dữ liệu typed duy nhất đi qua boundary."""
+    ids = set()
+    for doc in docs:
+        m = _TICKET_FILE_RE.match(str(doc.get("id", "")))
+        if m:
+            ids.add(int(m.group(1)))
+    return sorted(ids)
+
+
+def _customers_for_tickets(ticket_ids: list[int]) -> list[str]:
+    """Nguồn tin cậy: data/customers.json -> related_tickets (không dùng free text)."""
+    customers = json.loads(tools.CUSTOMERS_FILE.read_text(encoding="utf-8"))
+    wanted = set(ticket_ids)
+    return [c["customer_id"] for c in customers if wanted & set(c.get("related_tickets", []))]
+
+
 def handle(message: str, llm, log_dir: Path | None = None,
            principal_id: str = "support_l1") -> str:
-    raise RunnerScaffoldPending("BƯỚC 3c: implement trifecta split")
+    ledger_path = (Path(log_dir) / "ledger.jsonl") if log_dir else DEFAULT_LEDGER_PATH
+    expires_at = (datetime.now(timezone.utc) + RUN_TTL).isoformat()
+    session = uuid.uuid4().hex[:12]
+
+    # ---- Run A: untrusted content. Không read_customer, không http_post. ----
+    gate_a = _Gate(ledger_path, principal_id, "lab24-agent/run-a", f"{session}-a",
+                   ("search_docs",), 0, "summarize-tickets", expires_at)
+    allowed, _ = gate_a.decide("search_docs", {"query": message}, "internal")
+    docs: list[dict] = []
+    injected = None
+    if allowed:
+        docs = tools.search_docs(message)
+        injected = llm.find_injection("\n\n".join(d["text"] for d in docs))
+        gate_a.log("find_injection", {"docs": [d["id"] for d in docs]}, "internal", "allow",
+                   "untrusted text scanned for logging only; its customer_ids/urls are never used",
+                   injection_detected=injected is not None,
+                   matched_markers=list(injected.matched_markers) if injected else [])
+    ticket_ids = _ticket_ids(docs)  # list[int] — thứ duy nhất sang Run B
+
+    # ---- Run B: private data. Chỉ nhận list[int], suy customer_id từ related_tickets. ----
+    gate_b = _Gate(ledger_path, principal_id, "lab24-agent/run-b", f"{session}-b",
+                   ("read_customer",), 1, "support-reply", expires_at)
+    collected: list[dict] = []
+    for customer_id in _customers_for_tickets(ticket_ids):
+        # Kiểm quyền TRƯỚC khi đọc, không đọc rồi mới lọc.
+        ok, _ = gate_b.decide("read_customer", {"customer_id": customer_id}, "restricted")
+        if not ok:
+            continue
+        try:
+            collected.append(tools.read_customer(customer_id))
+        except tools.ToolError:
+            continue
+
+    # ---- Egress do nội dung untrusted đề xuất: chỉ là *đề xuất*, PEP quyết định. ----
+    if injected is not None:
+        gate_x = _Gate(ledger_path, principal_id, "lab24-agent/run-b", f"{session}-b",
+                       ("http_post",), 1, "support-reply", expires_at)
+        classification = "restricted" if collected else "internal"
+        body = {"records": [json.loads(pii.redact(json.dumps(r, ensure_ascii=False))) for r in collected]}
+        ok, _ = gate_x.decide("http_post", {"url": injected.target_url, "body": body},
+                              classification, egress=True)
+        if ok:
+            tools.http_post(injected.target_url, body)
+
+    safe_docs = [{**d, "text": pii.redact(d["text"])} for d in docs]
+    return llm.summarize(safe_docs)
