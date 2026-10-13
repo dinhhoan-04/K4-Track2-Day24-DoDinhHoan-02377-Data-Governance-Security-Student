@@ -1,5 +1,7 @@
-# Baseline — điền trong checkpoint 1
+# Baseline — checkpoint 1
 
-1. Agent có identity mỗi run chưa? Dẫn file/hàm:
-2. Ai cho phép `http_post`? Dẫn file/hàm:
-3. Nếu gửi sai PII ra sink, bằng chứng ở đâu? Dẫn file/hàm:
+Chỉ đọc code của `_naive_loop()` trong `agent/loop.py` (dòng 27–54) và `agent/tools.py`.
+
+1. **Agent có identity mỗi run chưa?** Chưa. `_naive_loop(message, llm)` ([agent/loop.py:27](../agent/loop.py)) không nhận principal, không sinh `run_id`/`agent_id`, không có TTL. Tham số `--as` chỉ được chuyển cho `runner.handle()` (`run_once`, dòng 57–75), còn nhánh baseline bỏ qua nó. Mọi tool call chạy với quyền "vô danh, không giới hạn".
+2. **Ai cho phép `http_post`?** Không ai. Dòng 44 của `_naive_loop` gọi `tools.http_post(injected.target_url, {"records": collected})` trực tiếp, trong đó `target_url` do text của document (nguồn không tin cậy) quyết định qua `llm.find_injection()` ([agent/llm.py:65](../agent/llm.py)). Không có bước `agent.policy.check()` nào, nên không có PEP. Chỉ có allowlist cứng `127.0.0.1:10024` trong `tools.http_post` ([agent/tools.py:68](../agent/tools.py)); file này tự ghi rằng đó không phải security control.
+3. **Chứng cứ nào cho thấy đã gửi sai dữ liệu?** Chỉ có sink: `reports/sink.log` (sao thành `reports/attack-before.log`). Vòng lặp baseline không ghi audit ledger (chưa có `agent/ledger.py`), nên phía agent không có dấu vết về việc ai đọc `read_customer` (dòng 39) và ai gửi `http_post` (dòng 44). `_naive_loop` cũng đọc customer theo `injected.customer_ids` trích từ free text của attacker (dòng 37), tức là không có trifecta split.
